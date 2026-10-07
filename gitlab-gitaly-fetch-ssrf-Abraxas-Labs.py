@@ -226,17 +226,15 @@ _builtins.print = _cprint
 
 """GitLab CE 19.4.1 Gitaly fetch omits resolved_address. Loopback lab client."""
 
-import os
 import subprocess
 import sys
+from pathlib import Path
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-LAB = os.path.join(HERE, "lab")
+LAB = Path(__file__).resolve().parent / "lab"
 
 
 def main() -> int:
-    os.chdir(LAB)
-    return subprocess.call(["bash", os.path.join(LAB, "run.sh"), *sys.argv[1:]])
+    return subprocess.call(["bash", str(LAB / "run.sh"), *sys.argv[1:]], cwd=LAB)
 
 
 if __name__ == "__main__":

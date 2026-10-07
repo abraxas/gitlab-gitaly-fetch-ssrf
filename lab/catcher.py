@@ -1,69 +1,116 @@
 #!/usr/bin/env python3
 """Fake GHE API + git-http-backend on :18080 inside the GitLab netns."""
 
+from __future__ import annotations
 
 import json
 import os
 import subprocess
 import threading
 import time
+from dataclasses import dataclass, field
+from http.client import HTTPMessage
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlparse
 
-WITNESS = os.environ.get("WITNESS", "GITLAB-GITALY-FETCH-SSRF-WITNESS")
-GIT_ROOT = os.environ.get("GIT_ROOT", "/git")
-SHARED_DIR = os.environ.get("SHARED_DIR", "/shared")
-LOG_DIR = os.environ.get("LOG_DIR", "/logs")
-BIND_HOST = os.environ.get("BIND_HOST", "0.0.0.0")
-BIND_PORT = int(os.environ.get("BIND_PORT", "18080"))
-PUBLIC_IP = os.environ.get("PUBLIC_IP", "1.1.1.1")
-GHE_NAME = os.environ.get("GHE_NAME", "ghe.lab")
-FLIP_PATH = os.path.join(SHARED_DIR, "rebind_flip")
-LOG_PATH = os.path.join(LOG_DIR, "catcher.log")
-BARE = os.path.join(GIT_ROOT, "org", "repo.git")
-CLONE_URL = f"http://{GHE_NAME}:{BIND_PORT}/org/repo.git"
-API_BASE = f"http://{GHE_NAME}:{BIND_PORT}/api/v3"
-
-_lock = threading.Lock()
-_repo_exact_gets = 0
-_rebind_armed = False
+SEED_DIR = Path("/tmp/seed-repo")
+REPO_ID = 4242
+OWNER_LOGIN = "org"
+REPO_NAME = "repo"
 
 
-def log(msg: str) -> None:
+@dataclass(frozen=True)
+class CatcherConfig:
+    witness: str
+    git_root: Path
+    shared_dir: Path
+    log_dir: Path
+    bind_host: str
+    bind_port: int
+    public_ip: str
+    ghe_name: str
+
+    @classmethod
+    def from_env(cls) -> CatcherConfig:
+        return cls(
+            witness=os.environ.get("WITNESS", "GITLAB-GITALY-FETCH-SSRF-WITNESS"),
+            git_root=Path(os.environ.get("GIT_ROOT", "/git")),
+            shared_dir=Path(os.environ.get("SHARED_DIR", "/shared")),
+            log_dir=Path(os.environ.get("LOG_DIR", "/logs")),
+            bind_host=os.environ.get("BIND_HOST", "0.0.0.0"),
+            bind_port=int(os.environ.get("BIND_PORT", "18080")),
+            public_ip=os.environ.get("PUBLIC_IP", "1.1.1.1"),
+            ghe_name=os.environ.get("GHE_NAME", "ghe.lab"),
+        )
+
+    @property
+    def flip_path(self) -> Path:
+        return self.shared_dir / "rebind_flip"
+
+    @property
+    def log_path(self) -> Path:
+        return self.log_dir / "catcher.log"
+
+    @property
+    def bare(self) -> Path:
+        return self.git_root / OWNER_LOGIN / f"{REPO_NAME}.git"
+
+    @property
+    def clone_url(self) -> str:
+        return f"http://{self.ghe_name}:{self.bind_port}/{OWNER_LOGIN}/{REPO_NAME}.git"
+
+    @property
+    def api_base(self) -> str:
+        return f"http://{self.ghe_name}:{self.bind_port}/api/v3"
+
+
+@dataclass
+class CatcherState:
+    repo_exact_gets: int = 0
+    rebind_armed: bool = False
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+def log(cfg: CatcherConfig, msg: str) -> None:
     line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}"
     print(line, flush=True)
-    os.makedirs(LOG_DIR, exist_ok=True)
-    with open(LOG_PATH, "a", encoding="utf-8") as fh:
+    cfg.log_dir.mkdir(parents=True, exist_ok=True)
+    with cfg.log_path.open("a", encoding="utf-8") as fh:
         fh.write(line + "\n")
 
 
-def seed_repo() -> None:
-    os.makedirs(os.path.join(GIT_ROOT, "org"), exist_ok=True)
-    if os.path.isdir(BARE):
-        log(f"git-seed exists {BARE}")
+def seed_repo(cfg: CatcherConfig) -> None:
+    (cfg.git_root / OWNER_LOGIN).mkdir(parents=True, exist_ok=True)
+    if cfg.bare.is_dir():
+        log(cfg, f"git-seed exists {cfg.bare}")
         return
-    seed = "/tmp/seed-repo"
-    os.makedirs(seed, exist_ok=True)
+    seed = SEED_DIR
+    seed.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env["HOME"] = "/tmp"
-    cmds = [
-        ["git", "init", seed],
-        ["git", "-C", seed, "config", "user.email", "lab@localhost.invalid"],
-        ["git", "-C", seed, "config", "user.name", "Lab"],
+    cmds: list[list[str]] = [
+        ["git", "init", str(seed)],
+        ["git", "-C", str(seed), "config", "user.email", "lab@localhost.invalid"],
+        ["git", "-C", str(seed), "config", "user.name", "Lab"],
     ]
     for cmd in cmds:
         subprocess.run(cmd, check=True, env=env, capture_output=True)
-    with open(os.path.join(seed, "WITNESS"), "w", encoding="utf-8") as fh:
-        fh.write(WITNESS + "\n")
-    subprocess.run(["git", "-C", seed, "add", "WITNESS"], check=True, env=env, capture_output=True)
-    subprocess.run(["git", "-C", seed, "commit", "-m", "witness"], check=True, env=env, capture_output=True)
-    subprocess.run(["git", "-C", seed, "branch", "-M", "master"], check=True, env=env, capture_output=True)
-    subprocess.run(["git", "clone", "--bare", seed, BARE], check=True, env=env, capture_output=True)
-    subprocess.run(["git", "--git-dir", BARE, "update-server-info"], check=True, env=env, capture_output=True)
-    log(f"git-seeded {BARE} witness={WITNESS}")
+    (seed / "WITNESS").write_text(cfg.witness + "\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(seed), "add", "WITNESS"], check=True, env=env, capture_output=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-m", "witness"], check=True, env=env, capture_output=True)
+    subprocess.run(["git", "-C", str(seed), "branch", "-M", "master"], check=True, env=env, capture_output=True)
+    subprocess.run(["git", "clone", "--bare", str(seed), str(cfg.bare)], check=True, env=env, capture_output=True)
+    subprocess.run(
+        ["git", "--git-dir", str(cfg.bare), "update-server-info"],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    log(cfg, f"git-seeded {cfg.bare} witness={cfg.witness}")
 
 
-def iptables_redirect(add: bool) -> None:
+def iptables_redirect(cfg: CatcherConfig, add: bool) -> None:
     args = [
         "iptables",
         "-t",
@@ -73,46 +120,52 @@ def iptables_redirect(add: bool) -> None:
         "-p",
         "tcp",
         "-d",
-        PUBLIC_IP,
+        cfg.public_ip,
         "--dport",
-        str(BIND_PORT),
+        str(cfg.bind_port),
         "-j",
         "REDIRECT",
         "--to-ports",
-        str(BIND_PORT),
+        str(cfg.bind_port),
     ]
     proc = subprocess.run(args, capture_output=True, text=True)
-    log(f"iptables {'add' if add else 'del'} rc={proc.returncode} err={(proc.stderr or '').strip()[:200]}")
+    log(
+        cfg,
+        f"iptables {'add' if add else 'del'} rc={proc.returncode} err={(proc.stderr or '').strip()[:200]}",
+    )
 
 
-def arm_rebind(reason: str) -> None:
-    global _rebind_armed
-    with _lock:
-        if _rebind_armed:
+def arm_rebind(cfg: CatcherConfig, state: CatcherState, reason: str) -> None:
+    with state.lock:
+        if state.rebind_armed:
             return
-        _rebind_armed = True
-        os.makedirs(SHARED_DIR, exist_ok=True)
-        with open(FLIP_PATH, "w", encoding="utf-8") as fh:
-            fh.write(reason + "\n")
-        iptables_redirect(False)
-        log(f"IOC rebind-armed reason={reason}")
+        state.rebind_armed = True
+        cfg.shared_dir.mkdir(parents=True, exist_ok=True)
+        cfg.flip_path.write_text(reason + "\n", encoding="utf-8")
+        iptables_redirect(cfg, False)
+        log(cfg, f"IOC rebind-armed reason={reason}")
 
 
-def repo_payload() -> dict:
-    owner = {"login": "org", "id": 7, "type": "Organization", "site_admin": False}
+def repo_payload(cfg: CatcherConfig) -> dict[str, object]:
+    owner: dict[str, object] = {
+        "login": OWNER_LOGIN,
+        "id": 7,
+        "type": "Organization",
+        "site_admin": False,
+    }
     return {
-        "id": 4242,
-        "name": "repo",
-        "full_name": "org/repo",
+        "id": REPO_ID,
+        "name": REPO_NAME,
+        "full_name": f"{OWNER_LOGIN}/{REPO_NAME}",
         "private": False,
-        "html_url": f"http://{GHE_NAME}:{BIND_PORT}/org/repo",
+        "html_url": f"http://{cfg.ghe_name}:{cfg.bind_port}/{OWNER_LOGIN}/{REPO_NAME}",
         "description": "gitaly fetch ssrf lab",
         "fork": False,
-        "url": f"{API_BASE}/repos/org/repo",
-        "clone_url": CLONE_URL,
-        "git_url": f"git://{GHE_NAME}:{BIND_PORT}/org/repo.git",
-        "ssh_url": f"git@{GHE_NAME}:org/repo.git",
-        "svn_url": CLONE_URL,
+        "url": f"{cfg.api_base}/repos/{OWNER_LOGIN}/{REPO_NAME}",
+        "clone_url": cfg.clone_url,
+        "git_url": f"git://{cfg.ghe_name}:{cfg.bind_port}/{OWNER_LOGIN}/{REPO_NAME}.git",
+        "ssh_url": f"git@{cfg.ghe_name}:{OWNER_LOGIN}/{REPO_NAME}.git",
+        "svn_url": cfg.clone_url,
         "default_branch": "master",
         "master_branch": "master",
         "has_issues": False,
@@ -133,11 +186,11 @@ def repo_payload() -> dict:
     }
 
 
-def user_payload() -> dict:
+def user_payload() -> dict[str, object]:
     return {"login": "lab", "id": 1, "type": "User", "site_admin": False}
 
 
-def rate_payload() -> dict:
+def rate_payload() -> dict[str, object]:
     reset = int(time.time()) + 3600
     return {
         "resources": {
@@ -169,11 +222,18 @@ def parse_cgi(output: bytes) -> tuple[int, list[tuple[str, str]], bytes]:
     return status, headers, body
 
 
-def git_backend(method: str, path: str, query: str, headers, body: bytes) -> tuple[int, list[tuple[str, str]], bytes]:
+def git_backend(
+    cfg: CatcherConfig,
+    method: str,
+    path: str,
+    query: str,
+    headers: HTTPMessage,
+    body: bytes,
+) -> tuple[int, list[tuple[str, str]], bytes]:
     env = os.environ.copy()
     env.update(
         {
-            "GIT_PROJECT_ROOT": GIT_ROOT,
+            "GIT_PROJECT_ROOT": str(cfg.git_root),
             "GIT_HTTP_EXPORT_ALL": "1",
             "REQUEST_METHOD": method,
             "PATH_INFO": path,
@@ -195,10 +255,10 @@ def git_backend(method: str, path: str, query: str, headers, body: bytes) -> tup
     )
     if proc.returncode != 0:
         err = (proc.stderr or b"").decode("utf-8", "replace")[:400]
-        log(f"git-http-backend rc={proc.returncode} err={err}")
+        log(cfg, f"git-http-backend rc={proc.returncode} err={err}")
         return 500, [("Content-Type", "text/plain")], b"git-http-backend failed\n"
     if proc.stderr:
-        log(f"git-http-backend-stderr {proc.stderr.decode('utf-8', 'replace')[:300]}")
+        log(cfg, f"git-http-backend-stderr {proc.stderr.decode('utf-8', 'replace')[:300]}")
     return parse_cgi(proc.stdout)
 
 
@@ -209,160 +269,178 @@ def normalize_api_path(path: str) -> str:
 
 
 def is_git_path(path: str) -> bool:
-    return "/org/repo.git" in path or path.endswith(".git") or "/git-upload-pack" in path or path.endswith("/info/refs")
+    return (
+        f"/{OWNER_LOGIN}/{REPO_NAME}.git" in path
+        or path.endswith(".git")
+        or "/git-upload-pack" in path
+        or path.endswith("/info/refs")
+    )
 
 
-class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+def make_handler(cfg: CatcherConfig, state: CatcherState) -> type[BaseHTTPRequestHandler]:
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
 
-    def log_message(self, fmt: str, *args) -> None:
-        return
-
-    def _read_body(self) -> bytes:
-        length = int(self.headers.get("Content-Length") or 0)
-        return self.rfile.read(length) if length else b""
-
-    def _send(self, status: int, headers: list[tuple[str, str]], body: bytes) -> None:
-        if self.command == "HEAD":
-            body = b""
-        self.send_response(status)
-        have_len = False
-        for key, val in headers:
-            if key.lower() == "status":
-                continue
-            if key.lower() == "content-length":
-                have_len = True
-            self.send_header(key, val)
-        if not have_len:
-            self.send_header("Content-Length", str(len(body)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
-
-    def _json(self, payload, status: int = 200) -> None:
-        raw = json.dumps(payload).encode("utf-8")
-        headers = [
-            ("Content-Type", "application/json"),
-            ("X-RateLimit-Limit", "5000"),
-            ("X-RateLimit-Remaining", "4999"),
-            ("X-RateLimit-Reset", str(int(time.time()) + 3600)),
-            ("X-GitHub-Media-Type", "github.v3; format=json"),
-        ]
-        self._send(status, headers, raw)
-
-    def _handle(self) -> None:
-        parsed = urlparse(self.path)
-        path = parsed.path
-        ua = self.headers.get("User-Agent", "")
-        host = self.headers.get("Host", "")
-        client = self.client_address[0] if self.client_address else "?"
-        dest = self.headers.get("X-Forwarded-For", "")
-        log(
-            f"{self.command} {path} host={host} ua={ua!r} client={client} dest={dest} "
-            f"flip={int(os.path.exists(FLIP_PATH))}"
-        )
-        if is_git_path(path) and not path.startswith("/api/"):
-            body = self._read_body()
-            if "git-upload-pack" in path or "info/refs" in path:
-                log(f"IOC git-http path={path} ua={ua!r} host={host} client={client}")
-            status, headers, out = git_backend(self.command, path, parsed.query, self.headers, body)
-            self._send(status, headers, out)
+        def log_message(self, fmt: str, *args: object) -> None:
             return
 
-        api = normalize_api_path(path).rstrip("/") or "/"
-        if self.command == "POST" and api.endswith("git-upload-pack"):
-            body = self._read_body()
-            status, headers, out = git_backend(self.command, path, parsed.query, self.headers, body)
-            self._send(status, headers, out)
-            return
+        def _read_body(self) -> bytes:
+            length = int(self.headers.get("Content-Length") or 0)
+            return self.rfile.read(length) if length else b""
 
-        self._read_body()
-        if api in ("/user", "/users/lab"):
-            self._json(user_payload())
-            return
-        if api == "/rate_limit":
-            self._json(rate_payload())
-            return
-        if api in ("/repositories/4242", "/repos/org/repo"):
-            self._json(repo_payload())
-            if api == "/repos/org/repo":
-                global _repo_exact_gets
-                with _lock:
-                    _repo_exact_gets += 1
-                    n = _repo_exact_gets
-                log(f"IOC github-repo-get n={n}")
-                if n >= 1:
-                    # Worker RepositoryImporter#client_repository is the first
-                    # GET /repos/org/repo (initial POST uses /repositories/:id).
-                    arm_rebind(f"repos-org-repo-get-{n}")
-            return
-        if api.startswith("/repos/org/repo/"):
-            rest = api[len("/repos/org/repo/") :]
-            if rest == "branches":
-                self._json(
-                    [
-                        {
-                            "name": "master",
-                            "commit": {"sha": "0" * 40, "url": f"{API_BASE}/repos/org/repo/commits/master"},
-                            "protected": False,
-                        }
-                    ]
+        def _send(self, status: int, headers: list[tuple[str, str]], body: bytes) -> None:
+            if self.command == "HEAD":
+                body = b""
+            self.send_response(status)
+            have_len = False
+            for key, val in headers:
+                if key.lower() == "status":
+                    continue
+                if key.lower() == "content-length":
+                    have_len = True
+                self.send_header(key, val)
+            if not have_len:
+                self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _json(self, payload: object, status: int = 200) -> None:
+            raw = json.dumps(payload).encode("utf-8")
+            headers = [
+                ("Content-Type", "application/json"),
+                ("X-RateLimit-Limit", "5000"),
+                ("X-RateLimit-Remaining", "4999"),
+                ("X-RateLimit-Reset", str(int(time.time()) + 3600)),
+                ("X-GitHub-Media-Type", "github.v3; format=json"),
+            ]
+            self._send(status, headers, raw)
+
+        def _handle(self) -> None:
+            parsed = urlparse(self.path)
+            path = parsed.path
+            ua = self.headers.get("User-Agent", "")
+            host = self.headers.get("Host", "")
+            client = self.client_address[0] if self.client_address else "?"
+            dest = self.headers.get("X-Forwarded-For", "")
+            log(
+                cfg,
+                f"{self.command} {path} host={host} ua={ua!r} client={client} dest={dest} "
+                f"flip={int(cfg.flip_path.exists())}",
+            )
+            if is_git_path(path) and not path.startswith("/api/"):
+                body = self._read_body()
+                if "git-upload-pack" in path or "info/refs" in path:
+                    log(cfg, f"IOC git-http path={path} ua={ua!r} host={host} client={client}")
+                status, headers, out = git_backend(
+                    cfg, self.command, path, parsed.query, self.headers, body
                 )
+                self._send(status, headers, out)
                 return
-            if rest.startswith("git/"):
+
+            api = normalize_api_path(path).rstrip("/") or "/"
+            if self.command == "POST" and api.endswith("git-upload-pack"):
+                body = self._read_body()
+                status, headers, out = git_backend(
+                    cfg, self.command, path, parsed.query, self.headers, body
+                )
+                self._send(status, headers, out)
+                return
+
+            self._read_body()
+            if api in ("/user", "/users/lab"):
+                self._json(user_payload())
+                return
+            if api == "/rate_limit":
+                self._json(rate_payload())
+                return
+            if api in (f"/repositories/{REPO_ID}", f"/repos/{OWNER_LOGIN}/{REPO_NAME}"):
+                self._json(repo_payload(cfg))
+                if api == f"/repos/{OWNER_LOGIN}/{REPO_NAME}":
+                    with state.lock:
+                        state.repo_exact_gets += 1
+                        n = state.repo_exact_gets
+                    log(cfg, f"IOC github-repo-get n={n}")
+                    if n >= 1:
+                        # Worker RepositoryImporter#client_repository is the first
+                        # GET /repos/org/repo (initial POST uses /repositories/:id).
+                        arm_rebind(cfg, state, f"repos-org-repo-get-{n}")
+                return
+            if api.startswith(f"/repos/{OWNER_LOGIN}/{REPO_NAME}/"):
+                rest = api[len(f"/repos/{OWNER_LOGIN}/{REPO_NAME}/") :]
+                if rest == "branches":
+                    self._json(
+                        [
+                            {
+                                "name": "master",
+                                "commit": {
+                                    "sha": "0" * 40,
+                                    "url": f"{cfg.api_base}/repos/{OWNER_LOGIN}/{REPO_NAME}/commits/master",
+                                },
+                                "protected": False,
+                            }
+                        ]
+                    )
+                    return
+                if rest.startswith("git/"):
+                    self._json([])
+                    return
                 self._json([])
                 return
+            if api.startswith("/repos/") or api.startswith("/repositories/"):
+                self._json([])
+                return
+            if api == "/":
+                self._json({"ok": True, "witness": cfg.witness})
+                return
             self._json([])
-            return
-        if api.startswith("/repos/") or api.startswith("/repositories/"):
+
+        def do_GET(self) -> None:
+            try:
+                self._handle()
+            except Exception as exc:
+                log(cfg, f"handler-error GET {exc}")
+                try:
+                    self._send(500, [("Content-Type", "text/plain")], b"error\n")
+                except OSError:
+                    pass
+
+        def do_POST(self) -> None:
+            try:
+                self._handle()
+            except Exception as exc:
+                log(cfg, f"handler-error POST {exc}")
+                try:
+                    self._send(500, [("Content-Type", "text/plain")], b"error\n")
+                except OSError:
+                    pass
+
+        def do_HEAD(self) -> None:
+            self.do_GET()
+
+        def do_PATCH(self) -> None:
+            self._read_body()
             self._json([])
-            return
-        if api == "/":
-            self._json({"ok": True, "witness": WITNESS})
-            return
-        self._json([])
 
-    def do_GET(self) -> None:
-        try:
-            self._handle()
-        except Exception as exc:  # noqa: BLE001
-            log(f"handler-error GET {exc}")
-            try:
-                self._send(500, [("Content-Type", "text/plain")], b"error\n")
-            except Exception:
-                pass
-
-    def do_POST(self) -> None:
-        try:
-            self._handle()
-        except Exception as exc:  # noqa: BLE001
-            log(f"handler-error POST {exc}")
-            try:
-                self._send(500, [("Content-Type", "text/plain")], b"error\n")
-            except Exception:
-                pass
-
-    def do_HEAD(self) -> None:
-        self.do_GET()
-
-    def do_PATCH(self) -> None:
-        self._read_body()
-        self._json([])
+    return Handler
 
 
-def main() -> None:
-    os.makedirs(SHARED_DIR, exist_ok=True)
-    os.makedirs(LOG_DIR, exist_ok=True)
-    if os.path.exists(FLIP_PATH):
-        os.remove(FLIP_PATH)
-    seed_repo()
-    iptables_redirect(True)
-    log(f"catcher-listen {BIND_HOST}:{BIND_PORT} clone={CLONE_URL}")
-    httpd = ThreadingHTTPServer((BIND_HOST, BIND_PORT), Handler)
+def main() -> int:
+    cfg = CatcherConfig.from_env()
+    state = CatcherState()
+    cfg.shared_dir.mkdir(parents=True, exist_ok=True)
+    cfg.log_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.flip_path.exists():
+        cfg.flip_path.unlink()
+    seed_repo(cfg)
+    iptables_redirect(cfg, True)
+    log(cfg, f"catcher-listen {cfg.bind_host}:{cfg.bind_port} clone={cfg.clone_url}")
+    httpd = ThreadingHTTPServer((cfg.bind_host, cfg.bind_port), make_handler(cfg, state))
     httpd.allow_reuse_address = True
     httpd.serve_forever()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

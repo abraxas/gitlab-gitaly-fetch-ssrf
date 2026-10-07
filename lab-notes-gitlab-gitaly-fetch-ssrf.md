@@ -1,4 +1,4 @@
-# GitLab CE 19.4.1 — Gitaly fetch omits resolved_address
+# GitLab CE 19.4.1 - Gitaly fetch omits resolved_address
 
 Pin `gitlab/gitlab-ce:19.4.1-ce.0`. `allow_local_requests` off.
 
