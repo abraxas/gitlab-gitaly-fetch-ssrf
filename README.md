@@ -13,6 +13,10 @@
   &nbsp;·&nbsp;
   <a href="https://github.com/abraxas/gitlab-gitaly-fetch-ssrf">gitlab-gitaly-fetch-ssrf</a>
 </p>
+<p align="center">
+  Write-up: <a href="https://abraxaslabs.tech/research/gitlab-gitaly-fetch-ssrf"><strong>https://abraxaslabs.tech/research/gitlab-gitaly-fetch-ssrf</strong></a>
+</p>
+
 
 # gitlab-gitaly-fetch-ssrf
 
